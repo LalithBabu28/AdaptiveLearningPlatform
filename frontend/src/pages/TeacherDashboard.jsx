@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import Sidebar from '../components/Sidebar'
 import { api } from '../api/client'
 import { useAuth } from '../components/AuthContext'
@@ -9,6 +9,57 @@ const SUBJECTS = ['DSA', 'DBMS', 'Compiler Design']
 function getBadgeClass(level) {
   if (!level || level === 'unclassified') return 'badge badge-unclassified'
   return `badge badge-${level.toLowerCase()}`
+}
+
+// ─── Confirmation Modal ──────────────────────────────────────
+function ConfirmModal({ isOpen, title, message, confirmLabel = 'Confirm', danger = false, onConfirm, onCancel }) {
+  useEffect(() => {
+    const handler = (e) => { if (e.key === 'Escape') onCancel() }
+    if (isOpen) document.addEventListener('keydown', handler)
+    return () => document.removeEventListener('keydown', handler)
+  }, [isOpen, onCancel])
+
+  if (!isOpen) return null
+
+  return (
+    <div
+      style={{
+        position: 'fixed', inset: 0, zIndex: 1000,
+        background: 'rgba(0,0,0,0.65)', backdropFilter: 'blur(4px)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        padding: '1rem',
+      }}
+      onClick={onCancel}
+    >
+      <div
+        className="card fade-up"
+        style={{ maxWidth: 420, width: '100%', padding: '2rem' }}
+        onClick={e => e.stopPropagation()}
+      >
+        <div style={{ fontSize: '2rem', marginBottom: '0.75rem', textAlign: 'center' }}>
+          {danger ? '⚠️' : '❓'}
+        </div>
+        <h3 style={{ textAlign: 'center', marginBottom: '0.5rem', fontSize: '1.1rem' }}>
+          {title}
+        </h3>
+        <p style={{ color: 'var(--text2)', textAlign: 'center', fontSize: '0.9rem', marginBottom: '1.5rem', lineHeight: 1.6 }}>
+          {message}
+        </p>
+        <div style={{ display: 'flex', gap: '0.75rem' }}>
+          <button className="btn btn-secondary w-full" onClick={onCancel}>
+            Cancel
+          </button>
+          <button
+            className={`btn w-full ${danger ? 'btn-danger' : 'btn-primary'}`}
+            onClick={onConfirm}
+            style={danger ? { background: 'var(--red)', color: '#fff', border: 'none' } : {}}
+          >
+            {confirmLabel}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
 }
 
 // ─── Overview ───────────────────────────────────────────────
@@ -87,13 +138,15 @@ function Students({ students, onRefresh }) {
   const [loading, setLoading]   = useState(false)
   const [msg, setMsg]           = useState('')
   const [err, setErr]           = useState('')
+  const [deleting, setDeleting] = useState(null)
+  const [modal, setModal]       = useState(null) // { email, name }
 
   const handleAdd = async e => {
     e.preventDefault()
     setLoading(true); setMsg(''); setErr('')
     try {
       await api.addStudent(name, email, password)
-      setMsg(`Student "${name}" added!`)
+      setMsg(`Student "${name}" added successfully!`)
       setName(''); setEmail(''); setPassword('')
       onRefresh()
     } catch (e) {
@@ -103,9 +156,34 @@ function Students({ students, onRefresh }) {
     }
   }
 
+  const handleDeleteConfirm = async () => {
+    const { email: targetEmail, name: targetName } = modal
+    setModal(null)
+    setDeleting(targetEmail)
+    try {
+      await api.removeStudent(targetEmail)
+      setMsg(`Student "${targetName}" has been removed.`)
+      onRefresh()
+    } catch (e) {
+      setErr(e.message)
+    } finally {
+      setDeleting(null)
+    }
+  }
+
   return (
     <div className="fade-up">
-      <div className="page-header"><h1>Student Management</h1><p>Add and view students</p></div>
+      <ConfirmModal
+        isOpen={!!modal}
+        title="Remove Student"
+        message={modal ? `Are you sure you want to permanently remove "${modal.name}" (${modal.email})? This will also delete all their test results and personalised assignments. This action cannot be undone.` : ''}
+        confirmLabel="Yes, Remove"
+        danger
+        onConfirm={handleDeleteConfirm}
+        onCancel={() => setModal(null)}
+      />
+
+      <div className="page-header"><h1>Student Management</h1><p>Add, view, and remove students</p></div>
       <div className="grid-2" style={{ alignItems: 'start' }}>
         <div className="card">
           <h3 style={{ marginBottom: '1.2rem', fontSize: '1rem' }}>Add New Student</h3>
@@ -145,18 +223,30 @@ function Students({ students, onRefresh }) {
                 <tr>
                   <th>Name</th>
                   <th>Email</th>
+                  <th style={{ width: 80 }}>Action</th>
                 </tr>
               </thead>
               <tbody>
                 {students.length === 0 && (
                   <tr>
-                    <td colSpan={2} style={{ color: 'var(--text3)', textAlign: 'center' }}>No students yet</td>
+                    <td colSpan={3} style={{ color: 'var(--text3)', textAlign: 'center' }}>No students yet</td>
                   </tr>
                 )}
                 {students.map(s => (
                   <tr key={s.email}>
-                    <td>{s.name}</td>
+                    <td style={{ fontWeight: 500 }}>{s.name}</td>
                     <td style={{ color: 'var(--text2)', fontSize: '0.85rem' }}>{s.email}</td>
+                    <td>
+                      <button
+                        className="btn btn-danger"
+                        style={{ padding: '0.25rem 0.6rem', fontSize: '0.78rem' }}
+                        disabled={deleting === s.email}
+                        onClick={() => setModal({ email: s.email, name: s.name })}
+                        title="Remove student"
+                      >
+                        {deleting === s.email ? '…' : '🗑 Remove'}
+                      </button>
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -212,7 +302,7 @@ function GenerateMCQ() {
         topic: q.topic || topic,
       }))
       await api.publishAssignment(subject, title, cleanedQuestions)
-      setMsg(`Assignment published for ${subject}!`)
+      setMsg(`✅ New assignment published for ${subject}! All students can now attempt a fresh test.`)
       markPublished()
     } catch (e) {
       setErr(e.message || 'Failed to publish assignment')
@@ -227,10 +317,12 @@ function GenerateMCQ() {
         <h1>Generate MCQ Assignment</h1>
         {questions.length > 0 && (
           <p style={{ color: 'var(--accent2)', fontSize: '0.85rem', marginTop: '0.25rem' }}>
-            ✓ {questions.length} questions loaded — state preserved across tabs
+            ✓ {questions.length} questions loaded — publishing creates a new assignment version
           </p>
         )}
       </div>
+
+      
 
       <div className="card" style={{ marginBottom: '1.5rem' }}>
         <div style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap', alignItems: 'flex-end' }}>
@@ -269,7 +361,7 @@ function GenerateMCQ() {
                 style={{ width: 240 }}
               />
               <button className="btn btn-success" onClick={publish} disabled={publishing || !title.trim()}>
-                {publishing ? 'Publishing…' : '📤 Publish'}
+                {publishing ? 'Publishing…' : '📤 Publish New Version'}
               </button>
             </div>
           </div>
@@ -410,9 +502,9 @@ function Labs() {
   )
 }
 
-// ─── Results — FIXED ─────────────────────────────────────────
+// ─── Results ─────────────────────────────────────────────────
 function Results({ results, onRefresh }) {
-  const [filterSubject, setFilterSubject]         = useState('All')
+  const [filterSubject, setFilterSubject]               = useState('All')
   const [filterClassification, setFilterClassification] = useState('All')
 
   const filtered = results.filter(r => {
@@ -433,7 +525,6 @@ function Results({ results, onRefresh }) {
         </button>
       </div>
 
-      {/* Filters */}
       <div style={{ display: 'flex', gap: '0.75rem', marginBottom: '1.25rem', flexWrap: 'wrap' }}>
         <div className="input-group" style={{ flexDirection: 'row', alignItems: 'center', gap: '0.5rem' }}>
           <label style={{ whiteSpace: 'nowrap', fontSize: '0.82rem' }}>Subject:</label>
@@ -452,7 +543,7 @@ function Results({ results, onRefresh }) {
           </select>
         </div>
         <div style={{ marginLeft: 'auto', fontSize: '0.82rem', color: 'var(--text3)', display: 'flex', alignItems: 'center' }}>
-          Showing {filtered.length} of {results.length} results
+          Showing {filtered.length} of {results.length}
         </div>
       </div>
 
@@ -475,7 +566,7 @@ function Results({ results, onRefresh }) {
               {filtered.length === 0 && (
                 <tr>
                   <td colSpan={8} style={{ textAlign: 'center', color: 'var(--text3)', padding: '2rem' }}>
-                    {results.length === 0 ? 'No results yet — students haven\'t submitted any tests.' : 'No results match the current filters.'}
+                    {results.length === 0 ? "No results yet — students haven't submitted any tests." : 'No results match the current filters.'}
                   </td>
                 </tr>
               )}
@@ -554,7 +645,6 @@ function TeacherDashboardInner() {
     fetchResults()
   }, [])
 
-  // Auto-refresh results every 30 seconds when on results page
   useEffect(() => {
     if (page !== 'results') return
     const interval = setInterval(fetchResults, 30_000)

@@ -14,12 +14,83 @@ function classificationColor(c) {
   return 'var(--text3)'
 }
 
+/**
+ * Derives a display state for a subject button given its attemptInfo.
+ * Returns: { label, sublabel, color, locked, canStart }
+ */
+function getSubjectState(info) {
+  if (!info || !info.attempted) {
+    return {
+      label: 'Start Test →',
+      sublabel: 'Not attempted',
+      color: 'var(--text3)',
+      locked: false,
+      canStart: true,
+      tag: null,
+    }
+  }
+
+  const { classification, retake_type, can_retake, attempts_remaining, score_percent } = info
+
+  if (retake_type === 'new_assignment') {
+    return {
+      label: '🆕 New Test Available →',
+      sublabel: `Previous: ${score_percent}% (${classification})`,
+      color: 'var(--accent2)',
+      locked: false,
+      canStart: true,
+      tag: { text: 'New Version', color: 'var(--accent2)', bg: 'rgba(167,139,250,0.12)' },
+    }
+  }
+
+  if (classification === 'Advanced') {
+    return {
+      label: 'Go to Lab →',
+      sublabel: `${score_percent}% — Completed`,
+      color: 'var(--green)',
+      locked: true,
+      canStart: false,
+      tag: { text: '✓ Advanced — Completed', color: 'var(--green)', bg: 'rgba(74,222,128,0.12)' },
+    }
+  }
+
+  if (classification === 'Intermediate') {
+    if (can_retake) {
+      return {
+        label: '↑ Improve Score →',
+        sublabel: `${score_percent}% — ${attempts_remaining} attempt${attempts_remaining !== 1 ? 's' : ''} left`,
+        color: 'var(--yellow)',
+        locked: false,
+        canStart: true,
+        tag: { text: `Intermediate — ${attempts_remaining} left`, color: 'var(--yellow)', bg: 'rgba(251,191,36,0.12)' },
+      }
+    }
+    return {
+      label: 'Max Attempts Reached',
+      sublabel: `${score_percent}% — Lab access unlocked`,
+      color: 'var(--yellow)',
+      locked: true,
+      canStart: false,
+      tag: { text: '✓ Intermediate — Lab Unlocked', color: 'var(--yellow)', bg: 'rgba(251,191,36,0.12)' },
+    }
+  }
+
+  // Weak
+  return {
+    label: '↻ Retake Test →',
+    sublabel: `${score_percent}% — Focus on weak topics`,
+    color: 'var(--red)',
+    locked: false,
+    canStart: true,
+    tag: { text: '↻ Retake (Weak)', color: 'var(--red)', bg: 'rgba(248,113,113,0.12)' },
+  }
+}
+
 // ─── Dashboard Home ──────────────────────────────────────────
 function Home({ user, results, onNav }) {
   const latestBySubject = {}
   results.forEach(r => {
-    if (!latestBySubject[r.subject] ||
-        r.date_time > latestBySubject[r.subject].date_time) {
+    if (!latestBySubject[r.subject] || r.date_time > latestBySubject[r.subject].date_time) {
       latestBySubject[r.subject] = r
     }
   })
@@ -51,10 +122,7 @@ function Home({ user, results, onNav }) {
                   <div className="progress-bar-wrap" style={{ marginBottom: '0.4rem' }}>
                     <div
                       className="progress-bar-fill"
-                      style={{
-                        width: `${res.score_percent}%`,
-                        background: classificationColor(res.classification),
-                      }}
+                      style={{ width: `${res.score_percent}%`, background: classificationColor(res.classification) }}
                     />
                   </div>
                   <div style={{ fontSize: '0.8rem', color: 'var(--text2)' }}>
@@ -85,8 +153,7 @@ function MCQTest({ user, onTestDone, onGoToLab }) {
   const [submitting, setSubmitting]   = useState(false)
   const [err, setErr]                 = useState('')
   const [timeLeft, setTimeLeft]       = useState(null)
-  const [attemptInfo, setAttemptInfo] = useState({}) // { [subject]: { attempted, can_retake, classification } }
-  const [checkingAttempt, setChecking] = useState(false)
+  const [attemptInfo, setAttemptInfo] = useState({})
   const timerRef = useRef(null)
 
   // Load attempt status for all subjects once
@@ -95,11 +162,8 @@ function MCQTest({ user, onTestDone, onGoToLab }) {
       const info = {}
       await Promise.all(
         SUBJECTS.map(async s => {
-          try {
-            info[s] = await api.checkAttempt(user.email, s)
-          } catch {
-            info[s] = { attempted: false, can_retake: true, classification: null }
-          }
+          try { info[s] = await api.checkAttempt(user.email, s) }
+          catch { info[s] = { attempted: false, can_retake: true, classification: null } }
         })
       )
       setAttemptInfo(info)
@@ -117,14 +181,18 @@ function MCQTest({ user, onTestDone, onGoToLab }) {
     setLoading(true); setErr(''); setResult(null); setAnswers({})
     try {
       const info = attemptInfo[subject]
+      const retakeType = info?.retake_type
 
-      // Weak student retaking → generate a FRESH personalised set
-      if (info?.attempted && info?.can_retake) {
+      if (retakeType === 'weak') {
         const data = await api.regenerateForWeak(user.email, subject)
         setAssignment(data)
         setTimeLeft(data.questions.length * 90)
+      } else if (retakeType === 'intermediate') {
+        const data = await api.regenerateForIntermediate(user.email, subject)
+        setAssignment(data)
+        setTimeLeft(data.questions.length * 90)
       } else {
-        // First attempt — load the published assignment
+        // First attempt or new assignment version
         const data = await api.getAssignment(subject)
         setAssignment(data)
         setTimeLeft(data.questions.length * 90)
@@ -142,7 +210,6 @@ function MCQTest({ user, onTestDone, onGoToLab }) {
       const data = await api.submitTest(user.email, subject, answers)
       setResult(data)
       onTestDone()
-      // Refresh attempt info for this subject
       try {
         const info = await api.checkAttempt(user.email, subject)
         setAttemptInfo(prev => ({ ...prev, [subject]: info }))
@@ -155,18 +222,13 @@ function MCQTest({ user, onTestDone, onGoToLab }) {
   }
 
   const handleRetake = async () => {
-    // This is called from AdaptiveResult for a Weak student
-    setResult(null)
-    setAssignment(null)
-    setAnswers({})
-    // Re-check attempt status
+    setResult(null); setAssignment(null); setAnswers({})
     try {
       const info = await api.checkAttempt(user.email, subject)
       setAttemptInfo(prev => ({ ...prev, [subject]: info }))
     } catch { /* ignore */ }
   }
 
-  const handleGoToLab = () => onGoToLab()
   const formatTime = s =>
     `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`
 
@@ -179,7 +241,7 @@ function MCQTest({ user, onTestDone, onGoToLab }) {
         result={result}
         subject={subject}
         onRetake={handleRetake}
-        onGoToLab={handleGoToLab}
+        onGoToLab={onGoToLab}
       />
     )
   }
@@ -192,63 +254,40 @@ function MCQTest({ user, onTestDone, onGoToLab }) {
       </div>
 
       {!assignment && (
-        <div className="card" style={{ maxWidth: 480 }}>
+        <div className="card" style={{ maxWidth: 520 }}>
           <h3 style={{ marginBottom: '1.2rem', fontSize: '1rem' }}>Choose Subject</h3>
           <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', marginBottom: '1rem' }}>
             {SUBJECTS.map(s => {
               const info = attemptInfo[s]
-              const isLocked = info?.attempted && !info?.can_retake
-              const isRetake = info?.attempted && info?.can_retake
+              const state = getSubjectState(info)
 
               return (
                 <button
                   key={s}
-                  className={`option-btn ${subject === s ? 'selected' : ''} ${isLocked ? 'locked' : ''}`}
-                  onClick={() => !isLocked && setSubject(s)}
-                  disabled={isLocked}
-                  style={isLocked ? { opacity: 0.5, cursor: 'not-allowed' } : {}}
+                  className={`option-btn ${subject === s ? 'selected' : ''} ${state.locked ? 'locked' : ''}`}
+                  onClick={() => !state.locked && setSubject(s)}
+                  disabled={state.locked}
+                  style={state.locked ? { opacity: 0.55, cursor: 'not-allowed' } : {}}
                 >
                   <span style={{ fontSize: '1.2rem' }}>{SUBJECT_ICONS[s]}</span>
-                  <span style={{ flex: 1 }}>{s}</span>
-                  {isLocked && (
-                    <span
-                      style={{
-                        fontSize: '0.72rem',
-                        background: 'rgba(74,222,128,0.12)',
-                        color: 'var(--green)',
-                        border: '1px solid rgba(74,222,128,0.3)',
-                        borderRadius: '100px',
-                        padding: '0.15rem 0.6rem',
-                        fontWeight: 600,
-                      }}
-                    >
-                      ✓ {info.classification} — Completed
+                  <span style={{ flex: 1, textAlign: 'left' }}>
+                    <span style={{ display: 'block', fontWeight: 600 }}>{s}</span>
+                    <span style={{ display: 'block', fontSize: '0.75rem', color: state.locked ? 'var(--text3)' : state.color, marginTop: '0.1rem' }}>
+                      {state.sublabel}
                     </span>
-                  )}
-                  {isRetake && (
-                    <span
-                      style={{
-                        fontSize: '0.72rem',
-                        background: 'rgba(248,113,113,0.12)',
-                        color: 'var(--red)',
-                        border: '1px solid rgba(248,113,113,0.3)',
-                        borderRadius: '100px',
-                        padding: '0.15rem 0.6rem',
-                        fontWeight: 600,
-                      }}
-                    >
-                      ↻ Retake (Weak)
-                    </span>
-                  )}
-                  {!info?.attempted && (
-                    <span
-                      style={{
-                        fontSize: '0.72rem',
-                        color: 'var(--text3)',
-                        fontWeight: 500,
-                      }}
-                    >
-                      Not attempted
+                  </span>
+                  {state.tag && (
+                    <span style={{
+                      fontSize: '0.72rem',
+                      background: state.tag.bg,
+                      color: state.tag.color,
+                      border: `1px solid ${state.tag.color}44`,
+                      borderRadius: '100px',
+                      padding: '0.15rem 0.65rem',
+                      fontWeight: 600,
+                      flexShrink: 0,
+                    }}>
+                      {state.tag.text}
                     </span>
                   )}
                 </button>
@@ -256,33 +295,81 @@ function MCQTest({ user, onTestDone, onGoToLab }) {
             })}
           </div>
 
-          {/* Retake notice for Weak students */}
-          {subject && attemptInfo[subject]?.can_retake && (
-            <div className="alert alert-warn" style={{ marginBottom: '1rem' }}>
+          {/* Context-aware retake notice */}
+          {subject && (() => {
+            const info = attemptInfo[subject]
+            if (!info?.attempted) return null
+            const { retake_type, score_percent } = info
+
+            if (retake_type === 'new_assignment') return (
+              <div className="alert alert-info" style={{ marginBottom: '1rem' }}>
+                <div>
+                  <strong>🆕 New Assignment Available</strong>
+                  <div style={{ fontSize: '0.85rem', marginTop: '0.25rem' }}>
+                    The teacher has published a new assignment. Your previous score of {score_percent}% is saved.
+                  </div>
+                </div>
+              </div>
+            )
+
+            if (retake_type === 'weak') return (
+              <div className="alert alert-warn" style={{ marginBottom: '1rem' }}>
+                <div>
+                  <strong>⚠ Retake Mode — Weak Topics Focus</strong>
+                  <div style={{ fontSize: '0.85rem', marginTop: '0.25rem' }}>
+                    You scored below 40%. A personalised set focusing on your weak topics will be generated.
+                  </div>
+                </div>
+              </div>
+            )
+
+            if (retake_type === 'intermediate') return (
+              <div className="alert alert-info" style={{ marginBottom: '1rem' }}>
+                <div>
+                  <strong>↑ Improvement Attempt</strong>
+                  <div style={{ fontSize: '0.85rem', marginTop: '0.25rem' }}>
+                    You scored {score_percent}%. You have {info.attempts_remaining} attempt{info.attempts_remaining !== 1 ? 's' : ''} remaining on this assignment.
+                  </div>
+                </div>
+              </div>
+            )
+            return null
+          })()}
+
+          {err && <div className="alert alert-danger" style={{ marginBottom: '1rem' }}>{err}</div>}
+
+          {subject && !attemptInfo[subject]?.can_retake && attemptInfo[subject]?.attempted && (
+            <div className="alert alert-success" style={{ marginBottom: '1rem' }}>
               <div>
-                <strong>⚠ Retake Mode</strong>
+                <strong>✓ Completed — Lab Access Granted</strong>
                 <div style={{ fontSize: '0.85rem', marginTop: '0.25rem' }}>
-                  You scored below 40% previously. A fresh set of questions will be generated
-                  focusing on your weak topics.
+                  You've reached the maximum attempts for this assignment.
+                  Head to <strong>Lab Work</strong> to continue.
                 </div>
               </div>
             </div>
           )}
 
-          {err && <div className="alert alert-danger" style={{ marginBottom: '1rem' }}>{err}</div>}
-
           <button
             className="btn btn-primary w-full btn-lg"
             onClick={loadTest}
-            disabled={!subject || loading || (subject && attemptInfo[subject]?.attempted && !attemptInfo[subject]?.can_retake)}
+            disabled={!subject || loading || (subject && !getSubjectState(attemptInfo[subject]).canStart)}
           >
             {loading
-              ? <><span className="spinner" style={{ width: 16, height: 16 }} />{' '}
-                {attemptInfo[subject]?.can_retake ? 'Generating new questions…' : 'Loading…'}
+              ? (
+                <>
+                  <span className="spinner" style={{ width: 16, height: 16 }} />
+                  {' '}
+                  {attemptInfo[subject]?.retake_type === 'weak'
+                    ? 'Generating weak-topic questions…'
+                    : attemptInfo[subject]?.retake_type === 'intermediate'
+                    ? 'Generating improvement set…'
+                    : 'Loading…'}
                 </>
-              : attemptInfo[subject]?.can_retake
-                ? '↻ Start Retake (New Questions) →'
-                : 'Start Test →'
+              )
+              : subject
+              ? getSubjectState(attemptInfo[subject]).label
+              : 'Select a subject first'
             }
           </button>
         </div>
@@ -298,45 +385,34 @@ function MCQTest({ user, onTestDone, onGoToLab }) {
               </div>
             </div>
             {timeLeft !== null && (
-              <div
-                style={{
-                  background: timeLeft < 60 ? 'rgba(248,113,113,0.15)' : 'var(--bg3)',
-                  border: `1px solid ${timeLeft < 60 ? 'var(--red)' : 'var(--border)'}`,
-                  borderRadius: 'var(--radius2)',
-                  padding: '0.4rem 1rem',
-                  fontFamily: 'var(--font-head)',
-                  fontSize: '1.1rem',
-                  color: timeLeft < 60 ? 'var(--red)' : 'var(--text)',
-                }}
-              >
+              <div style={{
+                background: timeLeft < 60 ? 'rgba(248,113,113,0.15)' : 'var(--bg3)',
+                border: `1px solid ${timeLeft < 60 ? 'var(--red)' : 'var(--border)'}`,
+                borderRadius: 'var(--radius2)',
+                padding: '0.4rem 1rem',
+                fontFamily: 'var(--font-head)',
+                fontSize: '1.1rem',
+                color: timeLeft < 60 ? 'var(--red)' : 'var(--text)',
+              }}>
                 ⏱ {formatTime(timeLeft)}
               </div>
             )}
           </div>
 
           <div className="progress-bar-wrap" style={{ marginBottom: '1.5rem' }}>
-            <div
-              className="progress-bar-fill"
-              style={{ width: `${(answered / total) * 100}%`, background: 'var(--accent)' }}
-            />
+            <div className="progress-bar-fill" style={{ width: `${(answered / total) * 100}%`, background: 'var(--accent)' }} />
           </div>
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
             {assignment.questions.map((q, i) => (
               <div key={q.id} className="mcq-card">
                 <div style={{ display: 'flex', gap: '0.6rem', marginBottom: '1rem', alignItems: 'flex-start' }}>
-                  <span
-                    style={{
-                      background: answers[q.id] ? 'var(--accent)' : 'var(--bg4)',
-                      color: answers[q.id] ? '#fff' : 'var(--text3)',
-                      borderRadius: '6px',
-                      padding: '0.15rem 0.5rem',
-                      fontSize: '0.78rem',
-                      fontWeight: 700,
-                      flexShrink: 0,
-                      marginTop: 2,
-                    }}
-                  >
+                  <span style={{
+                    background: answers[q.id] ? 'var(--accent)' : 'var(--bg4)',
+                    color: answers[q.id] ? '#fff' : 'var(--text3)',
+                    borderRadius: '6px', padding: '0.15rem 0.5rem',
+                    fontSize: '0.78rem', fontWeight: 700, flexShrink: 0, marginTop: 2,
+                  }}>
                     Q{i + 1}
                   </span>
                   <p style={{ fontSize: '0.95rem', lineHeight: 1.6 }}>{q.question}</p>
@@ -358,6 +434,7 @@ function MCQTest({ user, onTestDone, onGoToLab }) {
           </div>
 
           {err && <div className="alert alert-danger" style={{ marginTop: '1rem' }}>{err}</div>}
+
           <div style={{ marginTop: '1.5rem', display: 'flex', justifyContent: 'flex-end' }}>
             <button
               className="btn btn-primary btn-lg"
@@ -367,8 +444,8 @@ function MCQTest({ user, onTestDone, onGoToLab }) {
               {submitting
                 ? <><span className="spinner" style={{ width: 16, height: 16 }} /> Submitting…</>
                 : answered < total
-                  ? `Answer all questions (${total - answered} left)`
-                  : 'Submit Test ✓'
+                ? `Answer all questions (${total - answered} left)`
+                : 'Submit Test ✓'
               }
             </button>
           </div>
@@ -401,7 +478,7 @@ function LabPage({ user }) {
     <div className="fade-up">
       <div className="page-header">
         <h1>Lab Assignments</h1>
-        <p>Hands-on practice tasks</p>
+        <p>Hands-on practice tasks — available after passing the MCQ test</p>
       </div>
 
       {!lab && (
@@ -421,7 +498,7 @@ function LabPage({ user }) {
           </div>
           {err && (
             <div className="alert alert-danger" style={{ marginBottom: '1rem' }}>
-              {err.includes('40%') || err.includes('Weak') ? (
+              {err.includes('Weak') || err.includes('score') ? (
                 <div>
                   <strong>🔒 Access Denied</strong>
                   <div style={{ marginTop: '0.35rem', fontSize: '0.88rem' }}>{err}</div>
@@ -456,23 +533,18 @@ function LabPage({ user }) {
             <h3 style={{ marginBottom: '1rem', fontSize: '0.9rem', color: 'var(--text3)', letterSpacing: '0.06em' }}>TASKS</h3>
             <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
               {lab.tasks.map((t, i) => (
-                <div
-                  key={i}
-                  style={{
-                    display: 'flex', gap: '0.85rem', padding: '0.85rem 1rem',
-                    background: 'var(--bg3)', borderRadius: 'var(--radius2)',
-                    border: '1px solid var(--border)',
-                  }}
-                >
-                  <span
-                    style={{
-                      width: 28, height: 28, borderRadius: '8px',
-                      background: 'var(--accent)', color: '#fff',
-                      display: 'flex', alignItems: 'center', justifyContent: 'center',
-                      fontSize: '0.8rem', fontWeight: 700, flexShrink: 0,
-                      fontFamily: 'var(--font-head)',
-                    }}
-                  >
+                <div key={i} style={{
+                  display: 'flex', gap: '0.85rem', padding: '0.85rem 1rem',
+                  background: 'var(--bg3)', borderRadius: 'var(--radius2)',
+                  border: '1px solid var(--border)',
+                }}>
+                  <span style={{
+                    width: 28, height: 28, borderRadius: '8px',
+                    background: 'var(--accent)', color: '#fff',
+                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    fontSize: '0.8rem', fontWeight: 700, flexShrink: 0,
+                    fontFamily: 'var(--font-head)',
+                  }}>
                     {i + 1}
                   </span>
                   <span style={{ lineHeight: 1.7 }}>{t}</span>
@@ -491,8 +563,7 @@ function ChatPage({ user }) {
   const [messages, setMessages] = useState([
     {
       role: 'assistant',
-      content:
-        "Hi! I'm your AI tutor. Ask me anything about your subjects — I'll guide you with hints, not direct answers. What would you like to explore?",
+      content: "Hi! I'm your AI tutor. Ask me anything about your subjects — I'll guide you with hints, not direct answers. What would you like to explore?",
     },
   ])
   const [input, setInput]     = useState('')
@@ -515,10 +586,7 @@ function ChatPage({ user }) {
       const data = await api.chat(msg, subject, history)
       setMessages(m => [...m, { role: 'assistant', content: data.response }])
     } catch {
-      setMessages(m => [
-        ...m,
-        { role: 'assistant', content: 'Sorry, I had trouble connecting. Please try again.' },
-      ])
+      setMessages(m => [...m, { role: 'assistant', content: 'Sorry, I had trouble connecting. Please try again.' }])
     } finally {
       setLoading(false)
     }

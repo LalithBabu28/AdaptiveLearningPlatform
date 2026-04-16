@@ -1,11 +1,11 @@
 from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException
 from models import SubmitTestRequest
-import store
 from database.db import assignments_collection, students_collection, results_collection
 
-
 router = APIRouter()
+
+MAX_INTERMEDIATE_ATTEMPTS = 2
 
 
 def classify_student(score_percent: float) -> str:
@@ -22,8 +22,9 @@ def find_weak_topics(questions: list, answers: dict) -> list:
     for q in questions:
         qid = q["id"]
         if answers.get(qid) != q["correct_answer"]:
-            if q["topic"] not in wrong_topics:
-                wrong_topics.append(q["topic"])
+            topic = q.get("topic", "General")  # ✅ safe fallback
+            if topic not in wrong_topics:
+                wrong_topics.append(topic)
     return wrong_topics
 
 
@@ -38,14 +39,23 @@ def find_wrong_questions(questions: list, answers: dict) -> list:
                 "options": q["options"],
                 "correct_answer": q["correct_answer"],
                 "student_answer": answers.get(qid),
-                "topic": q["topic"],
+                "topic": q.get("topic", "General"),  # ✅ safe fallback (was q["topic"] → KeyError)
             })
     return wrong
 
 
 @router.post("/submit-test")
 def submit_test(req: SubmitTestRequest):
-    assignment = assignments_collection.find_one({"subject": req.subject})
+    # ── Resolve assignment (could be personalised or main) ──────────────────
+    intermediate_key = f"{req.subject}__intermediate__{req.student_email}"
+    weak_key = f"{req.subject}__{req.student_email}"
+
+    assignment = (
+        assignments_collection.find_one({"subject": intermediate_key})
+        or assignments_collection.find_one({"subject": weak_key})
+        or assignments_collection.find_one({"subject": req.subject})
+    )
+
     if not assignment:
         raise HTTPException(status_code=404, detail=f"No assignment found for {req.subject}")
 
@@ -53,28 +63,54 @@ def submit_test(req: SubmitTestRequest):
     if not student:
         raise HTTPException(status_code=404, detail="Student not found")
 
-    # ── Check previous attempt ──────────────────────────────────────────────
-    # Find the most recent result for this student + subject
+    assignment_version = assignment.get("assignment_version", "v1")
+
+    # ── Fetch latest result (any version) ──────────────────────────────────
     previous = results_collection.find_one(
         {"student_email": req.student_email, "subject": req.subject},
-        sort=[("date_time", -1)]
+        sort=[("date_time", -1)],
     )
 
+    # ── Attempt-control rules ───────────────────────────────────────────────
     if previous:
         prev_classification = previous.get("classification")
-        # Non-weak students already completed — block re-attempt
-        if prev_classification in ("Intermediate", "Advanced"):
-            raise HTTPException(
-                status_code=403,
-                detail=(
-                    f"You have already completed the {req.subject} test "
-                    f"with a '{prev_classification}' result. "
-                    "Lab access has been granted."
-                ),
-            )
-        # Weak students CAN retake, but check they are using the NEW assignment
-        # (the teacher must have regenerated/republished before retake is allowed)
-        # We allow retake freely for Weak — the frontend will ensure new MCQs are loaded
+        prev_version = previous.get("assignment_version", "v1")
+
+        # Get the CURRENT published (non-personalised) assignment version
+        published_assignment = assignments_collection.find_one({"subject": req.subject})
+        published_version = published_assignment.get("assignment_version", "v1") if published_assignment else "v1"
+
+        # If the teacher published a brand-new assignment → allow fresh attempt
+        is_new_assignment = (prev_version != published_version)
+
+        if not is_new_assignment:
+            if prev_classification == "Advanced":
+                raise HTTPException(
+                    status_code=403,
+                    detail=(
+                        f"You have already completed the {req.subject} test "
+                        "with an 'Advanced' result. Lab access is granted. "
+                        "Advanced students cannot retake."
+                    ),
+                )
+
+            if prev_classification == "Intermediate":
+                version_attempts = results_collection.count_documents({
+                    "student_email": req.student_email,
+                    "subject": req.subject,
+                    "assignment_version": {"$in": [assignment_version, published_version]},
+                })
+                if version_attempts >= MAX_INTERMEDIATE_ATTEMPTS:
+                    raise HTTPException(
+                        status_code=403,
+                        detail=(
+                            f"You have used all {MAX_INTERMEDIATE_ATTEMPTS} attempts "
+                            f"for the current {req.subject} assignment. "
+                            "Your lab access is already unlocked."
+                        ),
+                    )
+
+            # Weak students: always allowed to retake (no cap)
 
     # ── Grade the test ──────────────────────────────────────────────────────
     questions = assignment["questions"]
@@ -91,9 +127,12 @@ def submit_test(req: SubmitTestRequest):
     wrong_questions = find_wrong_questions(questions, req.answers)
 
     now = datetime.now(timezone.utc).isoformat()
-    attempt_number = (results_collection.count_documents(
-        {"student_email": req.student_email, "subject": req.subject}
-    ) + 1)
+    attempt_number = (
+        results_collection.count_documents(
+            {"student_email": req.student_email, "subject": req.subject}
+        )
+        + 1
+    )
 
     result_record = {
         "student_email": req.student_email,
@@ -107,9 +146,17 @@ def submit_test(req: SubmitTestRequest):
         "wrong_questions": wrong_questions,
         "date_time": now,
         "attempt_number": attempt_number,
+        "assignment_version": assignment_version,
     }
 
     results_collection.insert_one(result_record)
+    result_record.pop("_id", None)  # ✅ remove MongoDB ObjectId — not JSON serializable
+
+    # Clean up the used personalised assignment so it doesn't linger
+    for pkey in [intermediate_key, weak_key]:
+        if assignment.get("subject") == pkey:
+            assignments_collection.delete_one({"subject": pkey})
+            break
 
     return {
         "score": correct,
@@ -120,6 +167,7 @@ def submit_test(req: SubmitTestRequest):
         "wrong_questions": wrong_questions,
         "date_time": now,
         "attempt_number": attempt_number,
+        "assignment_version": assignment_version,
         "message": (
             f"You scored {correct}/{total} ({score_percent:.1f}%). "
             f"Classified as: {classification}"
@@ -129,44 +177,110 @@ def submit_test(req: SubmitTestRequest):
 
 @router.get("/results")
 def get_results():
-    # Return ALL results sorted by most recent first
-    results = list(results_collection.find(
-        {},
-        {"_id": 0}
-    ).sort("date_time", -1))
+    results = list(
+        results_collection.find({}, {"_id": 0}).sort("date_time", -1)
+    )
     return {"results": results}
 
 
 @router.get("/results/{student_email}")
 def get_student_results(student_email: str):
-    results = list(results_collection.find(
-        {"student_email": student_email},
-        {"_id": 0}
-    ).sort("date_time", -1))
+    results = list(
+        results_collection.find(
+            {"student_email": student_email}, {"_id": 0}
+        ).sort("date_time", -1)
+    )
     return {"results": results}
 
 
 @router.get("/check-attempt/{student_email}/{subject}")
 def check_attempt(student_email: str, subject: str):
     """
-    Returns the student's latest attempt info for a subject.
-    Frontend uses this to decide whether to show 'Start Test' or block.
+    Returns the student's latest attempt info + retake eligibility.
+
+    Logic:
+    - Advanced     → can_retake=False always
+    - Intermediate → can_retake=True if attempts_on_version < 2
+    - Weak         → can_retake=True always
+    - New assignment published → can_retake=True for everyone
     """
     latest = results_collection.find_one(
         {"student_email": student_email, "subject": subject},
-        sort=[("date_time", -1)]
+        sort=[("date_time", -1)],
     )
 
     if not latest:
-        return {"attempted": False, "can_retake": True, "classification": None}
+        return {
+            "attempted": False,
+            "can_retake": True,
+            "retake_type": None,
+            "classification": None,
+            "attempt_count": 0,
+            "attempts_remaining": 1,
+        }
 
     classification = latest.get("classification")
-    can_retake = classification == "Weak"
+    latest_version = latest.get("assignment_version", "v1")
 
+    # Check if a newer assignment has been published
+    published = assignments_collection.find_one({"subject": subject})
+    published_version = published.get("assignment_version", "v1") if published else "v1"
+    is_new_assignment = published_version != latest_version
+
+    if is_new_assignment:
+        return {
+            "attempted": True,
+            "can_retake": True,
+            "retake_type": "new_assignment",
+            "classification": classification,
+            "score_percent": latest.get("score_percent"),
+            "attempt_number": latest.get("attempt_number", 1),
+            "attempt_count": 1,
+            "attempts_remaining": 1,
+        }
+
+    if classification == "Advanced":
+        return {
+            "attempted": True,
+            "can_retake": False,
+            "retake_type": None,
+            "classification": "Advanced",
+            "score_percent": latest.get("score_percent"),
+            "attempt_number": latest.get("attempt_number", 1),
+            "attempt_count": results_collection.count_documents(
+                {"student_email": student_email, "subject": subject}
+            ),
+            "attempts_remaining": 0,
+        }
+
+    if classification == "Intermediate":
+        version_attempts = results_collection.count_documents({
+            "student_email": student_email,
+            "subject": subject,
+            "assignment_version": latest_version,
+        })
+        remaining = max(0, MAX_INTERMEDIATE_ATTEMPTS - version_attempts)
+        return {
+            "attempted": True,
+            "can_retake": remaining > 0,
+            "retake_type": "intermediate" if remaining > 0 else None,
+            "classification": "Intermediate",
+            "score_percent": latest.get("score_percent"),
+            "attempt_number": latest.get("attempt_number", 1),
+            "attempt_count": version_attempts,
+            "attempts_remaining": remaining,
+        }
+
+    # Weak
     return {
         "attempted": True,
-        "can_retake": can_retake,
-        "classification": classification,
+        "can_retake": True,
+        "retake_type": "weak",
+        "classification": "Weak",
         "score_percent": latest.get("score_percent"),
         "attempt_number": latest.get("attempt_number", 1),
+        "attempt_count": results_collection.count_documents(
+            {"student_email": student_email, "subject": subject}
+        ),
+        "attempts_remaining": 99,  # unlimited for Weak
     }
