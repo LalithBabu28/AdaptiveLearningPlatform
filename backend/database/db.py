@@ -1,6 +1,4 @@
-from pymongo import MongoClient
 
-# Connect to MongoDB
 import os
 from pymongo import MongoClient
 
